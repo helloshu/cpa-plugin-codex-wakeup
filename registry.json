@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "codex-wakeup",
+      "name": "Codex Wakeup",
+      "description": "Create managed Codex OAuth wakeup tasks with account selection, five schedule types, quota-reset triggers, history, and a built-in WebUI.",
+      "author": "helloshu",
+      "repository": "https://github.com/helloshu/cpa-plugin-codex-wakeup",
+      "homepage": "https://github.com/helloshu/cpa-plugin-codex-wakeup",
+      "license": "MIT",
+      "tags": [
+        "codex",
+        "scheduler",
+        "management"
+      ]
+    }
+  ]
+}

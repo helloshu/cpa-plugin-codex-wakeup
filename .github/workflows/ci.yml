@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu zip
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Race test
+        run: go test -race -count=1 ./...
+
+      - name: Build Linux AMD64
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: ./scripts/build.sh
+
+      - name: Build Linux ARM64
+        env:
+          CC: aarch64-linux-gnu-gcc
+          GOOS: linux
+          GOARCH: arm64
+        run: ./scripts/build.sh
+
+      - name: Package release assets
+        run: |
+          version=$(sed -n 's/^[[:space:]]*pluginVersion = "\([^"]*\)"/\1/p' main.go)
+          ./scripts/package-release.sh "$version"
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-wakeup-release-packages
+          path: dist/release/*
+          if-no-files-found: error
