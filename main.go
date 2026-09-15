@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginName    = "codex-wakeup"
-	pluginVersion = "0.1.5"
+	pluginVersion = "0.1.6"
 
 	abiVersion      = uint32(1)
 	pluginMaxSchema = uint32(5)

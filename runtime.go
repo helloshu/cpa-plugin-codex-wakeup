@@ -373,7 +373,13 @@ func (p *pluginRuntime) runDue(ctx context.Context, includeStartup bool) {
 	tasks := append([]state.Task(nil), p.state.Tasks...)
 	runOnStart := p.cfg.RunOnStart
 	p.mu.RUnlock()
-	p.refreshQuotaForTasks(ctx, tasks)
+	quotaEntries := p.refreshQuotaForTasks(ctx, tasks)
+	// A persisted quota cache is not proof the account still exists or is
+	// enabled. Require this scan's successful host listing as well.
+	liveQuotaAccounts := make(map[string]bool, len(quotaEntries))
+	for _, entry := range quotaEntries {
+		liveQuotaAccounts[entry.AuthIndex] = true
+	}
 	// A refresh may take time; pick up edits and completed manual runs before
 	// deciding which tasks are due, rather than using the pre-refresh snapshot.
 	p.mu.RLock()
@@ -394,6 +400,13 @@ func (p *pluginRuntime) runDue(ctx context.Context, includeStartup bool) {
 		}
 		if kind == state.ScheduleKindQuotaReset {
 			accounts := p.quotaDueAccounts(task, now)
+			filtered := accounts[:0]
+			for _, id := range accounts {
+				if liveQuotaAccounts[id] {
+					filtered = append(filtered, id)
+				}
+			}
+			accounts = filtered
 			if len(accounts) == 0 {
 				p.logTaskNotDue(task)
 				continue
@@ -497,7 +510,36 @@ func (p *pluginRuntime) executeTask(ctx context.Context, task state.Task, trigge
 		}
 		return record, nil
 	}
-	candidates := selectCandidates(entries, selected, task.AccountIDs)
+	predicate := eligibleAuth
+	if trigger == "quota_reset" {
+		// Another scan snapshot or a management edit may be stale by the
+		// time host listing returns. Recheck the current task under its run
+		// lock before allowing a recovery probe past host unavailability.
+		p.mu.RLock()
+		var current state.Task
+		for _, saved := range p.state.Tasks {
+			if saved.ID == task.ID && saved.CreatedAt.Equal(task.CreatedAt) && saved.Enabled && state.NormalizeSchedule(saved.Schedule, state.DefaultInterval).Kind == state.ScheduleKindQuotaReset {
+				current = saved
+				break
+			}
+		}
+		p.mu.RUnlock()
+		if current.ID == "" {
+			record.Status = "skipped"
+			record.CompletedAt = time.Now().UTC()
+			record.Results = []state.AccountResult{{Status: "skipped", Error: "quota task was disabled, changed or deleted"}}
+			return record, nil
+		}
+		task = current
+		due := make(map[string]bool)
+		for _, id := range p.quotaDueAccounts(task, started) {
+			due[id] = true
+		}
+		predicate = func(entry host.AuthFile) bool {
+			return monitorableAuth(entry) && due[strings.TrimSpace(entry.AuthIndex)]
+		}
+	}
+	candidates := selectCandidatesMatching(entries, predicate, selected, task.AccountIDs)
 	if len(candidates) == 0 {
 		record.Status = "skipped"
 		record.CompletedAt = time.Now().UTC()
@@ -535,6 +577,10 @@ func (p *pluginRuntime) executeTask(ctx context.Context, task state.Task, trigge
 }
 
 func selectCandidates(entries []host.AuthFile, selected ...[]string) []accountCandidate {
+	return selectCandidatesMatching(entries, eligibleAuth, selected...)
+}
+
+func selectCandidatesMatching(entries []host.AuthFile, eligible func(host.AuthFile) bool, selected ...[]string) []accountCandidate {
 	var selectors []string
 	for _, item := range selected {
 		if item != nil {
@@ -552,7 +598,7 @@ func selectCandidates(entries []host.AuthFile, selected ...[]string) []accountCa
 	result := make([]accountCandidate, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
-		if !eligibleAuth(entry) {
+		if !eligible(entry) {
 			continue
 		}
 		if len(selectedSet) != 0 && !matchesAuth(entry, selectedSet) {
@@ -617,6 +663,12 @@ func (p *pluginRuntime) executeAccount(parent context.Context, bridge host.Clien
 	authFile, err := bridge.GetAuthFile(parent, entry.AuthIndex)
 	if err != nil {
 		result.Error = scrubError(err)
+		result.DurationMS = time.Since(started).Milliseconds()
+		return result
+	}
+	if authFile.Disabled || strings.EqualFold(strings.TrimSpace(authFile.Status), "disabled") {
+		result.Status = "skipped"
+		result.Error = "account was disabled before execution"
 		result.DurationMS = time.Since(started).Milliseconds()
 		return result
 	}
@@ -717,6 +769,21 @@ func (p *pluginRuntime) finishRun(record state.RunRecord, task state.Task, candi
 	p.mu.Unlock()
 	err := p.persistSnapshot(path, snapshot, cfg.HistoryLimit)
 	p.persistMu.Unlock()
+	if record.Trigger == "quota_reset" {
+		for _, saved := range snapshot.Tasks {
+			if saved.ID != record.TaskID {
+				continue
+			}
+			for _, result := range record.Results {
+				if retry, ok := saved.QuotaRetries[result.AuthIndex]; ok && result.Status == "failed" {
+					p.log("warn", "quota wake retry scheduled", map[string]any{
+						"task_id": sanitizeText(saved.ID), "auth_index": sanitizeText(result.AuthIndex),
+						"reset_at": retry.ResetAt, "next_retry_at": retry.NextRetryAt, "failures": retry.Failures,
+					})
+				}
+			}
+		}
+	}
 	if err != nil {
 		p.log("warn", "state save failed", map[string]any{"error": scrubError(err)})
 	}

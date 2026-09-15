@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.6] - 2026-09-15
+
+### Fixed
+
+- Keep temporarily unavailable Codex OAuth file accounts visible and monitored; quota-triggered probes no longer wait for the host to clear its availability flag.
+- Exclude explicitly disabled or deleted accounts using each scan's current host listing, preventing stale quota caches from producing empty runs.
+- Preserve per-account pending resets and retry network/408/429/5xx failures with 2–30 minute backoff; retry credential/permission failures every 30 minutes using freshly read host credentials.
+- Persist retry deadlines across restarts without repeating accounts that already succeeded. Invalid-request errors remain visible and do not retry indefinitely.
+
+### Added
+
+- Account UI fields for host availability, quota monitoring and next query; task UI and host logs show pending retry deadlines.
+- Regression coverage for unavailable accounts, explicit disable/deletion, failed usage queries, credential renewal and restart recovery.
+
 ## [0.1.5] - 2026-09-15
 
 ### Fixed
@@ -42,5 +56,6 @@ All notable changes to this project are documented in this file.
 - Tokens, credential JSON, authorization headers, and full upstream responses are never persisted or rendered.
 - All external text shown by the WebUI is inserted through text nodes rather than HTML interpolation.
 
+[0.1.6]: https://github.com/helloshu/cpa-plugin-codex-wakeup/releases/tag/v0.1.6
 [0.1.5]: https://github.com/helloshu/cpa-plugin-codex-wakeup/releases/tag/v0.1.5
 [0.1.4]: https://github.com/helloshu/cpa-plugin-codex-wakeup/releases/tag/v0.1.4

@@ -34,6 +34,29 @@ func TestEligibleAuthRequiresCodexFileCredential(t *testing.T) {
 	}
 }
 
+func TestQuotaMonitoringDoesNotRequireHostAvailability(t *testing.T) {
+	for _, unavailable := range []host.AuthFile{
+		{AuthIndex: "a", Provider: "codex", Type: "codex", Source: "file", Unavailable: true},
+		{AuthIndex: "a", Provider: "codex", Type: "codex", Source: "file", Status: "unavailable"},
+	} {
+		if eligibleAuth(unavailable) {
+			t.Fatal("normal wake should still honor host unavailability")
+		}
+		if !monitorableAuth(unavailable) {
+			t.Fatal("temporary host unavailability must not stop quota monitoring")
+		}
+		unavailable.Disabled = true
+		if monitorableAuth(unavailable) {
+			t.Fatal("monitoring must honor explicit disable")
+		}
+		unavailable.Disabled = false
+		unavailable.Status = "disabled"
+		if monitorableAuth(unavailable) {
+			t.Fatal("monitoring must honor disabled status")
+		}
+	}
+}
+
 func TestParseCodexCredentialShapesAndJWTAccount(t *testing.T) {
 	jwt := jwtForClaims(t, map[string]any{
 		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-jwt"},

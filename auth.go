@@ -26,11 +26,17 @@ type codexCredential struct {
 }
 
 func eligibleAuth(entry host.AuthFile) bool {
-	if entry.RuntimeOnly || entry.Disabled || entry.Unavailable {
+	return monitorableAuth(entry) && !entry.Unavailable && !strings.EqualFold(strings.TrimSpace(entry.Status), "unavailable")
+}
+
+// Host unavailability can mean a temporary quota cooldown. Monitoring and
+// quota-triggered probes must not depend on the host clearing that flag first.
+func monitorableAuth(entry host.AuthFile) bool {
+	if entry.RuntimeOnly || entry.Disabled {
 		return false
 	}
 	status := strings.ToLower(strings.TrimSpace(entry.Status))
-	if status == "disabled" || status == "unavailable" {
+	if status == "disabled" {
 		return false
 	}
 	provider, typ := strings.ToLower(strings.TrimSpace(entry.Provider)), strings.ToLower(strings.TrimSpace(entry.Type))

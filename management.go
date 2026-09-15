@@ -244,6 +244,9 @@ type managementAccount struct {
 	Email                string `json:"email,omitempty"`
 	Provider             string `json:"provider,omitempty"`
 	Status               string `json:"status,omitempty"`
+	HostUnavailable      bool   `json:"host_unavailable"`
+	WakeAvailable        bool   `json:"wake_available"`
+	QuotaMonitoring      bool   `json:"quota_monitoring"`
 	LastRunAt            string `json:"last_run_at,omitempty"`
 	LastStatus           string `json:"last_status,omitempty"`
 	Successes            int64  `json:"success_count"`
@@ -268,6 +271,20 @@ func (p *pluginRuntime) accountsResponse() (managementResponse, error) {
 	for key, value := range p.state.Accounts {
 		cached[key] = value
 	}
+	monitored := make(map[string]bool)
+	monitorAll := false
+	if p.cfg.Enabled && p.cfg.AutoWake {
+		for _, task := range p.state.Tasks {
+			if task.Enabled && state.NormalizeSchedule(task.Schedule, state.DefaultInterval).Kind == state.ScheduleKindQuotaReset {
+				if len(task.AccountIDs) == 0 {
+					monitorAll = true
+				}
+				for _, id := range task.AccountIDs {
+					monitored[id] = true
+				}
+			}
+		}
+	}
 	p.mu.RUnlock()
 	if bridge == nil {
 		return p.jsonManagementResponse(map[string]any{"accounts": []managementAccount{}, "error": "host unavailable"})
@@ -278,10 +295,13 @@ func (p *pluginRuntime) accountsResponse() (managementResponse, error) {
 	}
 	accounts := make([]managementAccount, 0, len(entries))
 	for _, entry := range entries {
-		if !eligibleAuth(entry) {
+		if !monitorableAuth(entry) {
 			continue
 		}
 		item := managementAccount{AuthIndex: entry.AuthIndex, Name: sanitizeText(entry.Name), Label: sanitizeText(entry.Label), Email: maskEmail(entry.Email), Provider: sanitizeText(entry.Provider), Status: sanitizeText(entry.Status)}
+		item.HostUnavailable = !eligibleAuth(entry)
+		item.WakeAvailable = eligibleAuth(entry)
+		item.QuotaMonitoring = monitorAll || monitored[entry.AuthIndex]
 		if previous, ok := cached[entry.AuthIndex]; ok {
 			if !previous.LastRunAt.IsZero() {
 				item.LastRunAt = previous.LastRunAt.Format(time.RFC3339)
@@ -582,6 +602,7 @@ func (p *pluginRuntime) saveTasks(body []byte) (managementResponse, error) {
 			task.SuccessCount = oldTask.SuccessCount
 			task.FailureCount = oldTask.FailureCount
 			task.QuotaHandledResets = oldTask.QuotaHandledResets
+			task.QuotaRetries = oldTask.QuotaRetries
 			if schedulesEquivalent(oldTask.Schedule, task.Schedule) {
 				task.NextRunAt = oldTask.NextRunAt
 			}
@@ -594,6 +615,7 @@ func (p *pluginRuntime) saveTasks(body []byte) (managementResponse, error) {
 			task.SuccessCount = 0
 			task.FailureCount = 0
 			task.QuotaHandledResets = nil
+			task.QuotaRetries = nil
 		}
 		if task.NextRunAt.IsZero() {
 			if state.NormalizeSchedule(task.Schedule, state.DefaultInterval).Kind == state.ScheduleKindQuotaReset {

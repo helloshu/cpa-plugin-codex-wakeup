@@ -64,7 +64,14 @@ type Task struct {
 	FailureCount    int64      `json:"failure_count"`
 	// Per-account reset boundary already attempted by this quota task. A nil
 	// map denotes legacy state, which used the task-wide LastRunAt baseline.
-	QuotaHandledResets map[string]time.Time `json:"quota_handled_resets,omitempty"`
+	QuotaHandledResets map[string]time.Time  `json:"quota_handled_resets,omitempty"`
+	QuotaRetries       map[string]QuotaRetry `json:"quota_retries,omitempty"`
+}
+
+type QuotaRetry struct {
+	ResetAt     time.Time `json:"reset_at"`
+	NextRetryAt time.Time `json:"next_retry_at"`
+	Failures    int       `json:"failures"`
 }
 
 type AccountState struct {
@@ -183,6 +190,12 @@ func (s State) Clone() State {
 			clone.Tasks[index].QuotaHandledResets = make(map[string]time.Time, len(s.Tasks[index].QuotaHandledResets))
 			for key, value := range s.Tasks[index].QuotaHandledResets {
 				clone.Tasks[index].QuotaHandledResets[key] = value
+			}
+		}
+		if clone.Tasks[index].QuotaRetries != nil {
+			clone.Tasks[index].QuotaRetries = make(map[string]QuotaRetry, len(s.Tasks[index].QuotaRetries))
+			for key, value := range s.Tasks[index].QuotaRetries {
+				clone.Tasks[index].QuotaRetries[key] = value
 			}
 		}
 	}

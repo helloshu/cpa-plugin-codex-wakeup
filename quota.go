@@ -288,6 +288,9 @@ func quotaDueReset(task state.Task, authIndex string, account state.AccountState
 			due = reset
 		}
 	}
+	if retry, ok := task.QuotaRetries[authIndex]; ok && !due.After(retry.ResetAt) && now.Before(retry.NextRetryAt) {
+		return time.Time{}
+	}
 	return due
 }
 
@@ -314,6 +317,11 @@ func (p *pluginRuntime) quotaNextRunAtLocked(task state.Task, now time.Time) tim
 		baseline := quotaAccountBaseline(task, id)
 		accountTask.LastRunAt = &baseline
 		candidate := state.NextRunAt(accountTask, now, quotaResetTimes(account, quotaResetWindow(task)))
+		if retry, ok := task.QuotaRetries[id]; ok && retry.ResetAt.After(baseline) && retry.NextRetryAt.After(now) {
+			if candidate.IsZero() || retry.NextRetryAt.Before(candidate) {
+				candidate = retry.NextRetryAt
+			}
+		}
 		if !candidate.IsZero() && (next.IsZero() || candidate.Before(next)) {
 			next = candidate
 		}
@@ -345,6 +353,11 @@ func (p *pluginRuntime) markQuotaResetsHandledLocked(task *state.Task, record st
 		}
 		task.QuotaHandledResets = handled
 	}
+	retries := make(map[string]state.QuotaRetry, len(task.QuotaRetries))
+	for id, retry := range task.QuotaRetries {
+		retries[id] = retry
+	}
+	task.QuotaRetries = retries
 	for _, result := range record.Results {
 		if result.AuthIndex == "" || result.Status == "skipped" {
 			continue
@@ -352,14 +365,46 @@ func (p *pluginRuntime) markQuotaResetsHandledLocked(task *state.Task, record st
 		// Manual execution is still allowed for disabled tasks.
 		accountTask := *task
 		accountTask.Enabled = true
+		// An explicit manual wake may succeed before a pending retry timer.
+		accountTask.QuotaRetries = nil
 		reset := quotaDueReset(accountTask, result.AuthIndex, p.state.Accounts[result.AuthIndex], record.StartedAt)
 		if !reset.IsZero() {
+			if record.Trigger == "quota_reset" && result.Status == "failed" && (result.HTTPStatus == 0 || result.HTTPStatus == 401 || result.HTTPStatus == 403 || result.HTTPStatus == 408 || result.HTTPStatus == 429 || result.HTTPStatus >= 500) {
+				retry := task.QuotaRetries[result.AuthIndex]
+				if !retry.ResetAt.Equal(reset) {
+					retry = state.QuotaRetry{ResetAt: reset}
+				}
+				if retry.Failures < 30 {
+					retry.Failures++
+				}
+				delay := quotaRetryDelay(retry.Failures)
+				if result.HTTPStatus == 401 || result.HTTPStatus == 403 {
+					// Only the host/user can renew credentials or fix permissions.
+					// Retain the reset and re-read credentials at a low frequency.
+					delay = quotaMaximumBackoff
+				}
+				retry.NextRetryAt = record.CompletedAt.Add(delay)
+				task.QuotaRetries[result.AuthIndex] = retry
+				continue
+			}
 			task.QuotaHandledResets[result.AuthIndex] = reset
+			delete(task.QuotaRetries, result.AuthIndex)
 		}
 	}
 }
 
-func (p *pluginRuntime) refreshQuotaForTasks(ctx context.Context, tasks []state.Task) {
+func quotaRetryDelay(failures int) time.Duration {
+	delay := quotaRefreshInterval
+	for index := 1; index < failures && delay < quotaMaximumBackoff; index++ {
+		delay *= 2
+		if delay > quotaMaximumBackoff {
+			delay = quotaMaximumBackoff
+		}
+	}
+	return delay
+}
+
+func (p *pluginRuntime) refreshQuotaForTasks(ctx context.Context, tasks []state.Task) []host.AuthFile {
 	quotaTasks := make([]state.Task, 0)
 	selected := make(map[string]struct{})
 	refreshAll := false
@@ -378,23 +423,24 @@ func (p *pluginRuntime) refreshQuotaForTasks(ctx context.Context, tasks []state.
 		}
 	}
 	if len(quotaTasks) == 0 || ctx.Err() != nil {
-		return
+		return nil
 	}
 	p.mu.RLock()
 	bridge := p.host
 	p.mu.RUnlock()
 	if bridge == nil {
-		return
+		return nil
 	}
 	entries, err := bridge.ListAuthFiles(ctx)
 	if err != nil {
 		p.log("warn", "quota usage account listing failed", map[string]any{"error": scrubError(err)})
-		return
+		return nil
 	}
 	now := time.Now().UTC()
 	seen := make(map[string]struct{}, len(entries))
+	live := make([]host.AuthFile, 0, len(entries))
 	for _, entry := range entries {
-		if !eligibleAuth(entry) {
+		if !monitorableAuth(entry) {
 			continue
 		}
 		authIndex := strings.TrimSpace(entry.AuthIndex)
@@ -409,6 +455,7 @@ func (p *pluginRuntime) refreshQuotaForTasks(ctx context.Context, tasks []state.
 				continue
 			}
 		}
+		live = append(live, entry)
 		if !p.quotaRefreshDue(authIndex, now) {
 			continue
 		}
@@ -419,9 +466,10 @@ func (p *pluginRuntime) refreshQuotaForTasks(ctx context.Context, tasks []state.
 		_ = p.refreshAccountQuota(ctx, bridge, entry)
 		lock.Unlock()
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
 	}
+	return live
 }
 
 func (p *pluginRuntime) quotaRefreshDue(authIndex string, now time.Time) bool {
@@ -451,6 +499,8 @@ func (p *pluginRuntime) refreshAccountQuota(ctx context.Context, bridge host.Cli
 		refreshErr = scrubError(err)
 	} else if contextErr := requestContext.Err(); contextErr != nil {
 		refreshErr = scrubError(contextErr)
+	} else if authFile.Disabled || strings.EqualFold(strings.TrimSpace(authFile.Status), "disabled") {
+		refreshErr = "account was disabled before quota refresh"
 	} else {
 		credential, parseErr := parseCodexCredential(authFile.RawJSON)
 		if parseErr != nil {

@@ -21,6 +21,7 @@ func TestSaveTasksPreservesServerRuntimeFields(t *testing.T) {
 	old.SuccessCount = 9
 	old.FailureCount = 2
 	old.QuotaHandledResets = map[string]time.Time{"auth-a": last}
+	old.QuotaRetries = map[string]state.QuotaRetry{"auth-a": {ResetAt: last, NextRetryAt: last.Add(time.Hour), Failures: 3}}
 	p.state.Tasks = []state.Task{old}
 	forged := old
 	forged.Name = "edited"
@@ -31,6 +32,7 @@ func TestSaveTasksPreservesServerRuntimeFields(t *testing.T) {
 	forged.SuccessCount = 999
 	forged.FailureCount = 999
 	forged.QuotaHandledResets = map[string]time.Time{"auth-a": last.Add(24 * time.Hour)}
+	forged.QuotaRetries = map[string]state.QuotaRetry{"auth-a": {ResetAt: last, NextRetryAt: last, Failures: 999}}
 	raw, _ := json.Marshal(saveTasksRequest{Tasks: []state.Task{forged, {ID: "new", Name: "new", Enabled: true, Schedule: state.Schedule{Interval: "5h"}}}})
 	response, err := p.saveTasks(raw)
 	if err != nil || response.StatusCode != 200 {
@@ -47,6 +49,9 @@ func TestSaveTasksPreservesServerRuntimeFields(t *testing.T) {
 	}
 	if !saved.QuotaHandledResets["auth-a"].Equal(last) {
 		t.Fatalf("client forged quota cursor: %#v", saved.QuotaHandledResets)
+	}
+	if saved.QuotaRetries["auth-a"] != old.QuotaRetries["auth-a"] {
+		t.Fatal("client forged quota retry state")
 	}
 	for _, task := range p.state.Tasks {
 		if task.ID == "new" {
@@ -72,6 +77,28 @@ func TestAccountsResponseDoesNotRenderZeroTimestamp(t *testing.T) {
 	}
 	if strings.Contains(string(response.Body), `"id"`) {
 		t.Fatalf("accounts response exposed host ID instead of only auth_index: %s", response.Body)
+	}
+}
+
+func TestAccountsResponseKeepsUnavailableMonitoredAccounts(t *testing.T) {
+	fake := newRuntimeFakeHost()
+	fake.entries[0].Unavailable = true
+	fake.entries[1].Disabled = true
+	p := newRuntimeForTest(t, fake)
+	p.cfg.AutoWake = true
+	p.state.Tasks = []state.Task{quotaTask("monitor", []string{"auth-a"})}
+	response, err := p.accountsResponse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data struct {
+		Accounts []managementAccount `json:"accounts"`
+	}
+	if err := json.Unmarshal(response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Accounts) != 1 || data.Accounts[0].AuthIndex != "auth-a" || !data.Accounts[0].HostUnavailable || !data.Accounts[0].QuotaMonitoring || data.Accounts[0].WakeAvailable {
+		t.Fatalf("unavailable monitoring status = %s", response.Body)
 	}
 }
 

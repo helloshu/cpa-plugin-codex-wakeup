@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -20,6 +21,22 @@ type quotaRuntimeHost struct {
 type lateQuotaHost struct {
 	*quotaRuntimeHost
 	delay time.Duration
+}
+
+type changingQuotaListHost struct {
+	*runtimeFakeHost
+	onList  func()
+	listErr error
+}
+
+func (h *changingQuotaListHost) ListAuthFiles(ctx context.Context) ([]host.AuthFile, error) {
+	if h.onList != nil {
+		h.onList()
+	}
+	if h.listErr != nil {
+		return nil, h.listErr
+	}
+	return h.runtimeFakeHost.ListAuthFiles(ctx)
 }
 
 func (h *lateQuotaHost) HTTPDo(ctx context.Context, request host.HTTPRequest) (host.HTTPResponse, error) {
@@ -50,6 +67,213 @@ func (h *quotaRuntimeHost) HTTPDo(ctx context.Context, request host.HTTPRequest)
 func quotaTask(id string, accounts []string) state.Task {
 	now := time.Now().UTC().Add(-time.Hour)
 	return state.Task{ID: id, Name: id, Enabled: true, AccountIDs: accounts, CreatedAt: now, LastRunAt: timePtr(now), Schedule: state.Schedule{Kind: state.ScheduleKindQuotaReset, QuotaResetWindow: state.QuotaWindowEither}}
+}
+
+func TestUnavailableAccountIsMonitoredAndWokenAfterReset(t *testing.T) {
+	base := newRuntimeFakeHost()
+	base.entries[0].Unavailable = true
+	base.entries[0].Status = "unavailable"
+	now := time.Now().UTC()
+	quotaHost := &quotaRuntimeHost{runtimeFakeHost: base, quotaResponses: map[string]host.HTTPResponse{
+		"token-a": {StatusCode: 200, Body: []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"reset_at":%d}}}`, now.Add(-2*time.Minute).Unix()))},
+	}}
+	p := newRuntimeForTest(t, quotaHost)
+	p.state.Tasks = []state.Task{quotaTask("unavailable", []string{"auth-a"})}
+	p.runDue(context.Background(), false)
+	if quotaHost.quotaRequests != 1 || fmt.Sprint(requestTokens(base)) != "[token-a]" {
+		t.Fatalf("unavailable account was dropped: queries=%d wakes=%v", quotaHost.quotaRequests, requestTokens(base))
+	}
+	if !base.entries[0].Unavailable {
+		t.Fatal("plugin must not rewrite host availability")
+	}
+	p.runDue(context.Background(), false)
+	if len(requestTokens(base)) != 1 {
+		t.Fatal("same reset was repeated")
+	}
+}
+
+func TestDisabledOrDeletedAccountDoesNotRunFromCachedQuota(t *testing.T) {
+	for _, mode := range []string{"disabled", "status_disabled", "deleted"} {
+		t.Run(mode, func(t *testing.T) {
+			base := newRuntimeFakeHost()
+			switch mode {
+			case "disabled":
+				base.entries[0].Disabled = true
+			case "status_disabled":
+				base.entries[0].Status = "disabled"
+			case "deleted":
+				base.entries = base.entries[1:]
+			}
+			p := newRuntimeForTest(t, base)
+			now := time.Now().UTC()
+			p.state.Tasks = []state.Task{quotaTask("paused", []string{"auth-a"})}
+			p.state.Accounts["auth-a"] = state.AccountState{AuthIndex: "auth-a", PrimaryResetAt: timePtr(now.Add(-2 * time.Minute)), QuotaNextRefreshAt: timePtr(now.Add(time.Hour))}
+			p.runDue(context.Background(), false)
+			if len(requestTokens(base)) != 0 || len(p.state.History) != 0 || len(p.state.Tasks[0].QuotaHandledResets) != 0 {
+				t.Fatal("cached reset caused a run or consumed progress for an absent/disabled account")
+			}
+		})
+	}
+}
+
+func TestQuotaWakeRetriesPersistAndDoNotRepeatSuccessfulAccounts(t *testing.T) {
+	for _, code := range []int{0, 401, 403, 408, 429, 503} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			base := newRuntimeFakeHost()
+			base.entries[0].Unavailable = true
+			if code == 0 {
+				base.errors["token-a"] = errors.New("network timeout")
+			} else {
+				base.responses["token-a"] = host.HTTPResponse{StatusCode: code, Body: []byte(`{"error":{"message":"temporarily rejected"}}`)}
+			}
+			p := newRuntimeForTest(t, base)
+			now := time.Now().UTC()
+			reset := now.Add(-2 * time.Minute)
+			p.state.Tasks = []state.Task{quotaTask("retry", []string{"auth-a", "auth-b"})}
+			for _, id := range []string{"auth-a", "auth-b"} {
+				p.state.Accounts[id] = state.AccountState{AuthIndex: id, PrimaryResetAt: timePtr(reset), QuotaNextRefreshAt: timePtr(now.Add(time.Hour))}
+			}
+			p.runDue(context.Background(), false)
+			task := p.state.Tasks[0]
+			retry, ok := task.QuotaRetries["auth-a"]
+			if !ok || !retry.ResetAt.Equal(reset) || retry.Failures != 1 || !task.QuotaHandledResets["auth-b"].Equal(reset) || !task.QuotaHandledResets["auth-a"].Before(reset) {
+				t.Fatalf("failed A and successful B did not retain independent progress: %#v", task)
+			}
+			delay := 2 * time.Minute
+			if code == 401 || code == 403 {
+				delay = 30 * time.Minute
+			}
+			if !retry.NextRetryAt.Equal(task.LastRunAt.Add(delay)) || !task.NextRunAt.Equal(retry.NextRetryAt) {
+				t.Fatalf("retry delay/preview mismatch: %#v", task)
+			}
+			p.runDue(context.Background(), false)
+			if len(requestTokens(base)) != 2 {
+				t.Fatal("retry ignored the backoff")
+			}
+			loaded, err := state.Load(p.statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted := newRuntimeForTest(t, base)
+			restarted.state = loaded
+			restarted.runDue(context.Background(), false)
+			if len(requestTokens(base)) != 2 {
+				t.Fatal("restart lost the retry deadline")
+			}
+			if got := restarted.quotaDueAccounts(loaded.Tasks[0], retry.NextRetryAt); fmt.Sprint(got) != "[auth-a]" {
+				t.Fatalf("retry became due for wrong accounts: %v", got)
+			}
+			// Simulate the deadline elapsing and host credentials being renewed.
+			pending := loaded.Tasks[0].QuotaRetries["auth-a"]
+			pending.NextRetryAt = time.Now().UTC().Add(-time.Second)
+			restarted.state.Tasks[0].QuotaRetries["auth-a"] = pending
+			base.materials["auth-a"] = []byte(`{"access_token":"renewed-token","account_id":"acct-a"}`)
+			base.responses["renewed-token"] = base.responses["token-b"]
+			base.entries[0].Disabled = true
+			restarted.runDue(context.Background(), false)
+			if len(requestTokens(base)) != 2 {
+				t.Fatal("pending retry bypassed explicit disable")
+			}
+			base.entries[0].Disabled = false
+			restarted.runDue(context.Background(), false)
+			restarted.runDue(context.Background(), false)
+			if got := requestTokens(base); len(got) != 3 || !strings.Contains(fmt.Sprint(got), "renewed-token") {
+				t.Fatalf("retry did not use current credentials or repeated B: %v", got)
+			}
+			if len(restarted.state.Tasks[0].QuotaRetries) != 0 || !restarted.state.Tasks[0].QuotaHandledResets["auth-a"].Equal(reset) {
+				t.Fatal("successful retry did not clear the pending reset")
+			}
+		})
+	}
+}
+
+func TestQuotaQueryRecoveryResumesUnavailableAccountAfterRestart(t *testing.T) {
+	base := newRuntimeFakeHost()
+	base.entries[0].Unavailable = true
+	fixture := &quotaRuntimeHost{runtimeFakeHost: base, quotaResponses: map[string]host.HTTPResponse{
+		"token-a": {StatusCode: 401, Body: []byte(`{"error":{"message":"expired"}}`)},
+	}}
+	p := newRuntimeForTest(t, fixture)
+	now := time.Now().UTC()
+	p.state.Tasks = []state.Task{quotaTask("query-recovery", []string{"auth-a"})}
+	p.state.Accounts["auth-a"] = state.AccountState{AuthIndex: "auth-a", PrimaryResetAt: timePtr(now.Add(-2 * time.Minute))}
+	p.runDue(context.Background(), false)
+	if fixture.quotaRequests != 1 || len(requestTokens(base)) != 0 || p.state.Accounts["auth-a"].QuotaLastError == "" {
+		t.Fatal("failed query must be visible without using stale reset to wake")
+	}
+	loaded, err := state.Load(p.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := newRuntimeForTest(t, fixture)
+	restarted.state = loaded
+	restarted.runDue(context.Background(), false)
+	if fixture.quotaRequests != 1 {
+		t.Fatal("restart ignored quota query backoff")
+	}
+	account := restarted.state.Accounts["auth-a"]
+	account.QuotaNextRefreshAt = timePtr(now.Add(-time.Second))
+	restarted.state.Accounts["auth-a"] = account
+	fixture.quotaResponses["token-a"] = host.HTTPResponse{StatusCode: 200, Body: []byte(`{"rate_limit":{"primary_window":{"reset_after_seconds":18000}}}`)}
+	restarted.runDue(context.Background(), false)
+	if fixture.quotaRequests != 2 || len(requestTokens(base)) != 1 || restarted.state.Accounts["auth-a"].QuotaLastError != "" {
+		t.Fatal("successful query did not resume unavailable account's pending reset")
+	}
+}
+
+func TestQuotaRetryBackoffCapsAndPermanentRequestErrorDoesNotLoop(t *testing.T) {
+	if quotaRetryDelay(1) != 2*time.Minute || quotaRetryDelay(2) != 4*time.Minute || quotaRetryDelay(100) != 30*time.Minute {
+		t.Fatal("unexpected retry backoff")
+	}
+	base := newRuntimeFakeHost()
+	base.responses["token-a"] = host.HTTPResponse{StatusCode: 400, Body: []byte(`{"error":{"message":"invalid model"}}`)}
+	p := newRuntimeForTest(t, base)
+	now := time.Now().UTC()
+	p.state.Tasks = []state.Task{quotaTask("bad-request", []string{"auth-a"})}
+	p.state.Accounts["auth-a"] = state.AccountState{AuthIndex: "auth-a", PrimaryResetAt: timePtr(now.Add(-2 * time.Minute)), QuotaNextRefreshAt: timePtr(now.Add(time.Hour))}
+	p.runDue(context.Background(), false)
+	p.runDue(context.Background(), false)
+	if len(requestTokens(base)) != 1 || len(p.state.Tasks[0].QuotaRetries) != 0 || p.state.Tasks[0].LastStatus != "failed" {
+		t.Fatal("permanent request error should be reported without a retry loop")
+	}
+}
+
+func TestQuotaProbeRechecksTaskAndHostBeforeExecution(t *testing.T) {
+	for _, scenario := range []string{"list_failed", "task_disabled", "task_deleted", "selection_changed"} {
+		t.Run(scenario, func(t *testing.T) {
+			base := newRuntimeFakeHost()
+			fixture := &changingQuotaListHost{runtimeFakeHost: base}
+			p := newRuntimeForTest(t, fixture)
+			now := time.Now().UTC()
+			p.state.Tasks = []state.Task{quotaTask("recheck", []string{"auth-a"})}
+			p.state.Accounts["auth-a"] = state.AccountState{AuthIndex: "auth-a", PrimaryResetAt: timePtr(now.Add(-2 * time.Minute)), QuotaNextRefreshAt: timePtr(now.Add(time.Hour))}
+			if scenario == "list_failed" {
+				fixture.listErr = errors.New("host listing failed")
+			} else {
+				calls := 0
+				fixture.onList = func() {
+					calls++
+					if calls != 2 {
+						return
+					}
+					p.mu.Lock()
+					defer p.mu.Unlock()
+					switch scenario {
+					case "task_disabled":
+						p.state.Tasks[0].Enabled = false
+					case "task_deleted":
+						p.state.Tasks = nil
+					case "selection_changed":
+						p.state.Tasks[0].AccountIDs = []string{"auth-b"}
+					}
+				}
+			}
+			p.runDue(context.Background(), false)
+			if len(requestTokens(base)) != 0 {
+				t.Fatal("stale host/task state bypassed the quota probe gate")
+			}
+		})
+	}
 }
 
 func TestParseQuotaUsageSupportsResetAtAndResetAfterSeconds(t *testing.T) {
