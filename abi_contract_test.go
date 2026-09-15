@@ -54,9 +54,13 @@ func TestRegistrationSchemaNegotiation(t *testing.T) {
 		raw  string
 		want uint32
 	}{
+		{name: "host schema 1", raw: `{"schema_version":1}`, want: 1},
+		{name: "host schema 2", raw: `{"schema_version":2}`, want: 2},
+		{name: "host schema 3", raw: `{"schema_version":3}`, want: 3},
 		{name: "host schema 4", raw: `{"schema_version":4}`, want: 4},
 		{name: "host schema 5", raw: `{"schema_version":5}`, want: 5},
-		{name: "future host schema", raw: `{"schema_version":99}`, want: 5},
+		{name: "host schema 6", raw: `{"schema_version":6}`, want: 6},
+		{name: "future host schema", raw: `{"schema_version":99}`, want: 6},
 		{name: "missing schema", raw: `{}`, want: 1},
 		{name: "zero schema", raw: `{"schema_version":0}`, want: 1},
 	}
@@ -74,20 +78,29 @@ func TestLifecycleRegistrationUsesNegotiatedSchema(t *testing.T) {
 	p := newPluginRuntime()
 	t.Cleanup(p.shutdown)
 	for _, method := range []string{methodPluginRegister, methodPluginReconfigure} {
-		raw, err := p.handleMethod(method, []byte(`{"schema_version":4}`))
-		if err != nil {
-			t.Fatalf("%s error = %v", method, err)
-		}
-		var envelope rpcEnvelope
-		if err := json.Unmarshal(raw, &envelope); err != nil {
-			t.Fatalf("%s envelope: %v", method, err)
-		}
-		var response registration
-		if err := json.Unmarshal(envelope.Result, &response); err != nil {
-			t.Fatalf("%s result: %v", method, err)
-		}
-		if response.SchemaVersion != 4 {
-			t.Fatalf("%s schema = %d, want 4", method, response.SchemaVersion)
+		for _, schema := range []uint32{4, 5, 6, 99, 0} {
+			request, _ := json.Marshal(map[string]uint32{"schema_version": schema})
+			raw, err := p.handleMethod(method, request)
+			if err != nil {
+				t.Fatalf("%s schema %d error = %v", method, schema, err)
+			}
+			var envelope rpcEnvelope
+			if err := json.Unmarshal(raw, &envelope); err != nil || !envelope.OK {
+				t.Fatalf("%s envelope: %s, %v", method, raw, err)
+			}
+			var response registration
+			if err := json.Unmarshal(envelope.Result, &response); err != nil {
+				t.Fatalf("%s result: %v", method, err)
+			}
+			want := schema
+			if want == 0 {
+				want = 1
+			} else if want > 6 {
+				want = 6
+			}
+			if response.SchemaVersion != want {
+				t.Fatalf("%s schema = %d, want %d", method, response.SchemaVersion, want)
+			}
 		}
 	}
 }

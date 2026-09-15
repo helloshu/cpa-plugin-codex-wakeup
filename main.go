@@ -46,10 +46,12 @@ import (
 
 const (
 	pluginName    = "codex-wakeup"
-	pluginVersion = "0.1.6"
+	pluginVersion = "0.1.7"
 
-	abiVersion      = uint32(1)
-	pluginMaxSchema = uint32(5)
+	abiVersion = uint32(1)
+	// Schema 6 preserves management JSON strings. The UI renders dynamic
+	// content as text, so it does not need the host's legacy HTML entities.
+	pluginMaxSchema = uint32(6)
 	// schemaVersion is retained as the public/max schema diagnostic value.
 	schemaVersion = pluginMaxSchema
 

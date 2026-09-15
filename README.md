@@ -10,7 +10,11 @@
 
 ## 适用基线
 
-当前实现按 CLIProxyAPI `v7.2.151`（commit `5208aec703b5ce7e3445f6e9d91cc13b3e78003a`）的原生插件 ABI 编写：ABI 版本为 1，插件最高 RPC schema 版本为 5。注册和重新配置时会读取宿主请求的 `schema_version`，以 `min(宿主版本, 5)` 应答；宿主缺失或传入 0 按 schema 1 处理，绝不会返回 0。因此也可被只支持 schema 4 或更低兼容 schema 的宿主加载。管理 API 的变更路由由宿主管理 key 保护；插件页面只在浏览器内存中使用用户输入的 key。页面在 key 为空时不会请求任何管理 API，避免被 CLIProxyAPI 的失败计数误封来源 IP。
+当前核验基线为 CLIProxyAPI [`v7.3.3`](https://github.com/router-for-me/CLIProxyAPI/releases/tag/v7.3.3)（commit `7bbfeaf8a7acf2cd5a834dcb0842539fe6aabc2b`，2026-09-15 核验）。原生 ABI 仍为 1，插件最高 RPC schema 升至 6。CI 使用固定 SHA-256 校验的官方 Linux AMD64 程序实际加载 `.so`，验证插件注册、配置传递、账号列表回调、页面和管理接口。宿主必须包含原生插件支持，不能使用官方 `_no-plugin` 构建。
+
+注册和重新配置时以 `min(宿主 schema_version, 6)` 应答；宿主缺失或传入 0 时按 schema 1 处理。单元测试覆盖 schema 1–6、缺失/0 和未来版本的协商，保留旧宿主的协议回退；旧宿主尚未逐版本进行完整实测。schema 6 避免宿主把管理 JSON 字符串里的 `<`、`>`、`&`、引号转成 HTML 实体，防止任务名称或提示词在读取、编辑后发生变化。页面动态内容通过文本节点渲染，敏感字段仍会脱敏。
+
+管理 API 的变更路由由宿主管理 key 保护；插件页面只在浏览器内存中使用用户输入的 key。页面在 key 为空时不会请求任何管理 API，避免被 CLIProxyAPI 的失败计数误封来源 IP。
 
 ## 构建与安装
 
@@ -57,7 +61,7 @@ dist/linux/amd64/codex-wakeup.so
 同时构建 Linux AMD64/ARM64 后，可生成符合 plugin-store 命名规则的 zip 和校验文件：
 
 ```bash
-./scripts/package-release.sh 0.1.6
+./scripts/package-release.sh 0.1.7
 ```
 
 ## 配置示例
@@ -184,9 +188,19 @@ go test ./...
 go vet ./...
 go test -race ./...
 ./scripts/build.sh
-./scripts/package-release.sh 0.1.6
+./scripts/package-release.sh 0.1.7
 nm -D --defined-only dist/linux/amd64/codex-wakeup.so | grep cliproxy_plugin_init
 sha256sum dist/linux/amd64/codex-wakeup.so
 ```
 
-测试使用 Go fake host，覆盖两账号串行、账号精确映射、单账号失败隔离、调度推进、ABI wire、状态落盘和脱敏；不会向真实 Codex endpoint 发请求。当前交付未在真实账号上验证，请先使用隔离测试环境。
+Go 单元测试使用 fake host，覆盖两账号串行、账号精确映射、单账号失败隔离、调度推进、ABI wire、状态落盘和脱敏。
+
+另有原生宿主集成检查（Python 3，无额外依赖）：
+
+```bash
+python3 scripts/smoke-host.py \
+  --host /path/to/cli-proxy-api \
+  --plugin dist/linux/amd64/codex-wakeup.so
+```
+
+脚本创建临时配置和空账号目录，仅监听本机，关闭自动唤醒；测试结束后停止宿主、清理目录。检查范围包含管理鉴权、任务增删改/启停/持久化、触发预览，以及特殊字符在保存与读取后的内容一致性。CI 固定运行 CLIProxyAPI v7.3.3 的 Linux AMD64 实测；ARM64 进行交叉构建。两类测试均不向真实 Codex endpoint 发请求，尚未覆盖真实账号的额度重置全过程。

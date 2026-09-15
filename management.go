@@ -44,7 +44,7 @@ type managementRequest struct {
 
 type managementResponse struct {
 	// These keys intentionally match pluginapi.ManagementResponse, whose
-	// fields have no JSON tags in CLIProxyAPI v7.2.151. Body is []byte and is
+	// fields have no JSON tags in CLIProxyAPI v7.3.3. Body is []byte and is
 	// therefore base64-encoded by encoding/json on the RPC wire.
 	StatusCode int                 `json:"StatusCode,omitempty"`
 	Headers    map[string][]string `json:"Headers,omitempty"`
