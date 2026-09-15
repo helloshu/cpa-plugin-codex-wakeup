@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginName    = "codex-wakeup"
-	pluginVersion = "0.1.7"
+	pluginVersion = "0.1.8"
 
 	abiVersion = uint32(1)
 	// Schema 6 preserves management JSON strings. The UI renders dynamic

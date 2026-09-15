@@ -40,6 +40,24 @@ jobs:
           GOARCH: amd64
         run: ./scripts/build.sh
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+
+      - name: Build and verify companion management page
+        run: bash scripts/build-management.sh
+
+      - name: Set up browser smoke test
+        run: |
+          npm install --prefix "$RUNNER_TEMP/codex-browser" playwright@1.58.2
+          "$RUNNER_TEMP/codex-browser/node_modules/.bin/playwright" install --with-deps chromium
+
       - name: Smoke test with CLIProxyAPI v7.3.3
         run: |
           cpa_dir=$(mktemp -d)
@@ -49,7 +67,9 @@ jobs:
             --output "$cpa_dir/cpa.tar.gz"
           echo '7af8c99cd08eee3ccc81d1596e8a31785674d3de6bd7ec61416d59493dd8fc01  '"$cpa_dir/cpa.tar.gz" | sha256sum --check
           tar -xzf "$cpa_dir/cpa.tar.gz" -C "$cpa_dir" cli-proxy-api
-          python3 scripts/smoke-host.py --host "$cpa_dir/cli-proxy-api" --plugin dist/linux/amd64/codex-wakeup.so
+          NODE_PATH="$RUNNER_TEMP/codex-browser/node_modules" python3 scripts/smoke-host.py \
+            --host "$cpa_dir/cli-proxy-api" --plugin dist/linux/amd64/codex-wakeup.so \
+            --management-html dist/management/management.html --browser-test
 
       - name: Build Linux ARM64
         env:
