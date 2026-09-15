@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.1.5] - 2026-09-15
 
 ### Fixed
 
@@ -42,4 +42,5 @@ All notable changes to this project are documented in this file.
 - Tokens, credential JSON, authorization headers, and full upstream responses are never persisted or rendered.
 - All external text shown by the WebUI is inserted through text nodes rather than HTML interpolation.
 
+[0.1.5]: https://github.com/helloshu/cpa-plugin-codex-wakeup/releases/tag/v0.1.5
 [0.1.4]: https://github.com/helloshu/cpa-plugin-codex-wakeup/releases/tag/v0.1.4

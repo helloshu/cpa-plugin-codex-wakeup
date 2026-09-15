@@ -57,7 +57,7 @@ dist/linux/amd64/codex-wakeup.so
 同时构建 Linux AMD64/ARM64 后，可生成符合 plugin-store 命名规则的 zip 和校验文件：
 
 ```bash
-./scripts/package-release.sh 0.1.4
+./scripts/package-release.sh 0.1.5
 ```
 
 ## 配置示例
@@ -176,7 +176,7 @@ go test ./...
 go vet ./...
 go test -race ./...
 ./scripts/build.sh
-./scripts/package-release.sh 0.1.4
+./scripts/package-release.sh 0.1.5
 nm -D --defined-only dist/linux/amd64/codex-wakeup.so | grep cliproxy_plugin_init
 sha256sum dist/linux/amd64/codex-wakeup.so
 ```
