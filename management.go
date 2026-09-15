@@ -212,6 +212,9 @@ func (p *pluginRuntime) previewTask(body []byte) (managementResponse, error) {
 		}
 		preview = append(preview, next.UTC().Format(time.RFC3339))
 		last := next
+		if task.Schedule.Kind == state.ScheduleKindQuotaReset {
+			last = next.Add(-state.QuotaResetDelay)
+		}
 		task.LastRunAt = &last
 		cursor = next.In(time.Local).Add(time.Nanosecond)
 	}
@@ -578,6 +581,7 @@ func (p *pluginRuntime) saveTasks(body []byte) (managementResponse, error) {
 			task.LastStatus = oldTask.LastStatus
 			task.SuccessCount = oldTask.SuccessCount
 			task.FailureCount = oldTask.FailureCount
+			task.QuotaHandledResets = oldTask.QuotaHandledResets
 			if schedulesEquivalent(oldTask.Schedule, task.Schedule) {
 				task.NextRunAt = oldTask.NextRunAt
 			}
@@ -589,10 +593,11 @@ func (p *pluginRuntime) saveTasks(body []byte) (managementResponse, error) {
 			task.LastStatus = ""
 			task.SuccessCount = 0
 			task.FailureCount = 0
+			task.QuotaHandledResets = nil
 		}
 		if task.NextRunAt.IsZero() {
 			if state.NormalizeSchedule(task.Schedule, state.DefaultInterval).Kind == state.ScheduleKindQuotaReset {
-				task.NextRunAt = state.NextRunAt(*task, now.In(time.Local), p.quotaTimesForTaskLocked(*task))
+				task.NextRunAt = p.quotaNextRunAtLocked(*task, now.In(time.Local))
 			} else {
 				task.NextRunAt = state.NextRunAt(*task, now.In(time.Local), nil)
 			}
@@ -703,7 +708,31 @@ func (p *pluginRuntime) historyResponse(query map[string][]string) (managementRe
 
 func (p *pluginRuntime) diagnostics() map[string]any {
 	stateValue, cfg, path, running := p.stateSnapshot()
-	return map[string]any{"plugin": pluginName, "version": pluginVersion, "schema_version": schemaVersion, "abi_version": abiVersion, "enabled": cfg.Enabled, "auto_wake": cfg.AutoWake, "worker_running": running, "state_file": relativeStatePath(path), "tasks": len(stateValue.Tasks), "history": len(stateValue.History), "sensitive_logging": false, "upstream_url": cfg.UpstreamURL, "last_error": ""}
+	p.mu.RLock()
+	scheduler := p.scheduler
+	hasHost := p.host != nil
+	p.mu.RUnlock()
+	reason := "running"
+	switch {
+	case !cfg.Enabled:
+		reason = "plugin_disabled"
+	case !cfg.AutoWake:
+		reason = "auto_wake_disabled"
+	case !hasHost:
+		reason = "host_unavailable"
+	case !running:
+		reason = "worker_stopped"
+	}
+	now := time.Now()
+	return map[string]any{
+		"plugin": pluginName, "version": pluginVersion, "schema_version": schemaVersion, "abi_version": abiVersion,
+		"enabled": cfg.Enabled, "auto_wake": cfg.AutoWake, "worker_running": running, "scheduler_status": reason,
+		"state_file": relativeStatePath(path), "tasks": len(stateValue.Tasks), "history": len(stateValue.History),
+		"sensitive_logging": false, "upstream_url": cfg.UpstreamURL, "last_error": scheduler.LastError,
+		"scan_interval": cfg.ScanInterval.String(), "request_timeout": cfg.RequestTimeout.String(),
+		"server_local_time": now.Format("2006-01-02 15:04:05 -07:00"), "server_timezone": now.Format("MST (UTC-07:00)"),
+		"scheduler": scheduler,
+	}
 }
 
 func uniqueNonEmpty(values []string) []string {

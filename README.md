@@ -109,10 +109,26 @@ plugins:
 - `daily`：每天在服务器本地时区的 `daily_time` 执行；
 - `weekly`：每周在 `weekly_days`（周日为 0、周六为 6）和服务器本地 `weekly_time` 执行；
 - `interval`：从任务创建或上次完成时间起按 `interval` 执行，允许 1 分钟至 30 天；
-- `quota_reset`：只读查询官方 `https://chatgpt.com/backend-api/wham/usage`，在 `primary_window`、`secondary_window` 或 `either` 指定的真实额度窗口重置后执行一次；
+- `quota_reset`：只读查询官方 `https://chatgpt.com/backend-api/wham/usage`，每个账号独立在 `primary_window`、`secondary_window` 或 `either` 指定的真实额度窗口重置 **1 分钟后**执行一次；
 - `startup`：每次插件 worker generation 启动后执行一次，可配置 0 至 10080 分钟延迟。
 
 额度查询结果缓存 2 分钟，失败时指数退避到最多 30 分钟；查询失败不会用旧的 reset 时间触发唤醒。`run_on_start` 是旧版全局兼容开关：启用后，尚未运行的普通每日、每周和间隔任务会在 worker 启动时额外执行一次；独立的 `startup` 任务不依赖该开关。
+
+同一个额度重置任务中，账号 A 到期只会唤醒 A；账号 B 按自己的重置时间加 1 分钟独立触发。多个账号都已经到期时，才会在同一轮扫描内依次执行。任务为每个账号保存已处理的重置边界，账号忙碌而跳过时保留待执行状态，不会因其他账号完成而丢失。请求已发出但失败时，该账号的本次边界仍视为已尝试，等待下一个重置；页面“立即执行”仍可手动唤醒任务所选账号。
+
+成功刷新额度时，如果官方已将窗口切换到下一周期或清空窗口，插件会保留刚过去的重置时间，再按各任务、各账号的处理进度判断是否需要唤醒，避免刷新覆盖时间导致漏触发。这个边界会随状态持久化，重启后仍可执行未处理的重置；已经处理的重置不会重复执行。worker 启动后会立即扫描已经到期的任务，不必再等待一个 `scan_interval`。自动触发时间包含 1 分钟等待，并受扫描周期和请求耗时影响；默认每 30 秒扫描一次。
+
+## 日志与漏触发排查
+
+- **执行历史**：页面“最近历史”、`GET /v0/management/codex-wakeup/history?limit=300`，以及 `state_file` 的 `history` 字段。默认文件是相对于 CLIProxyAPI 工作目录的 `plugins/codex-wakeup/state.json`，默认保留最近 300 次记录。这里保存已结束的执行，不代表完整的调度日志。
+- **宿主日志**：插件通过 `host.log` 写入 CLIProxyAPI 的日志系统，消息以 `codex-wakeup:` 开头；具体输出到控制台还是文件由宿主配置决定，插件不单独创建 `.log` 文件。info 记录调度启停、任务开始和完成；warn 记录额度查询、执行或落盘失败；debug 记录扫描时任务未到期、任务禁用等跳过原因。任务日志带有 `task_id`、`run_id`、触发来源、状态和脱敏结果，不包含 token、提示词或完整响应。
+- **调度诊断**：`GET /v0/management/codex-wakeup/diagnostics` 返回 `scheduler_status`、服务器时区、扫描间隔和 `scheduler` 心跳。`last_scan_at` 是最近扫描开始时间，`last_scan_completed_at` 是最近完成时间；`phase` 为 `quota_refresh` 表示正在查询额度，`executing` 表示正在执行 `current_task_id`。如果开始时间长期不更新，或扫描长期未完成，可以结合宿主日志定位停在哪一步。心跳和 `last_error` 为当前配置生命周期内的信息，重新配置或重启会重置；`last_error` 保留最近错误，不代表错误仍未恢复。
+
+自动执行需要插件配置中的 `enabled: true`、`auto_wake: true` 和任务自己的 `enabled: true` 同时成立。`auto_wake` 默认是 `false`，仅在页面启用任务不会开启后台扫描。诊断中的 `scheduler_status` 会明确返回 `plugin_disabled`、`auto_wake_disabled`、`host_unavailable`、`worker_stopped` 或 `running`。
+
+额度重置任务的 `interval: 5h` 是兼容字段，并不表示每隔 5 小时执行；实际依据 `quota_reset_window` 选择的官方窗口。`next_run_at` 是所选账号中最早的未来触发预览，已包含重置后 1 分钟等待。排查漏触发时还应对照账号的 `quota_last_refresh_at`、`quota_next_refresh_at`、`quota_last_error` 和重置时间。账号的 `primary_elapsed_reset_at` / `secondary_elapsed_reset_at` 保存已观察到的过去边界；任务的 `quota_handled_resets` 分账号记录已处理到哪个边界，这些进度由服务器维护，不能通过管理 API 伪造。
+
+旧版本已经覆盖掉的重置时间无法从当前快照还原；升级后从仍可观察到的窗口边界开始保留。需要补做一次唤醒时，可在页面使用“立即执行”。
 
 ## 管理页面与 API
 

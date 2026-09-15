@@ -90,6 +90,23 @@ func TestQuotaDueUsesCreatedAtWhenNeverRun(t *testing.T) {
 	}
 }
 
+func TestQuotaPreviewAndDueIncludeOneMinuteDelay(t *testing.T) {
+	reset := time.Date(2026, 9, 15, 6, 11, 55, 0, time.UTC)
+	task := Task{Enabled: true, CreatedAt: reset.Add(-time.Hour), Schedule: Schedule{Kind: ScheduleKindQuotaReset}}
+	triggerAt := reset.Add(time.Minute)
+	for _, now := range []time.Time{reset.Add(-time.Second), reset, triggerAt.Add(-time.Nanosecond)} {
+		if DueQuota(task, now, []time.Time{reset}) {
+			t.Fatalf("quota task became due at %s before grace period elapsed", now)
+		}
+		if next := NextRunAt(task, now, []time.Time{reset}); !next.Equal(triggerAt) {
+			t.Fatalf("preview at %s = %s, want %s", now, next, triggerAt)
+		}
+	}
+	if !DueQuota(task, triggerAt, []time.Time{reset}) {
+		t.Fatal("quota task was not due exactly one minute after reset")
+	}
+}
+
 func TestScheduleValidationRejectsUnknownKindAndClampedStartupDelay(t *testing.T) {
 	if err := ValidateSchedule(Schedule{Kind: "bogus", Interval: "5h"}); err == nil {
 		t.Fatal("unknown schedule kind unexpectedly accepted")

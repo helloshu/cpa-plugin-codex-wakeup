@@ -235,11 +235,15 @@ func NextRunAt(task Task, now time.Time, quotaResets []time.Time) time.Time {
 		}
 		var candidate time.Time
 		for _, reset := range quotaResets {
-			if reset.IsZero() || !reset.After(last) || !reset.After(now) {
+			if reset.IsZero() || !reset.After(last) {
 				continue
 			}
-			if candidate.IsZero() || reset.Before(candidate) {
-				candidate = reset
+			triggerAt := reset.Add(QuotaResetDelay)
+			if !triggerAt.After(now) {
+				continue
+			}
+			if candidate.IsZero() || triggerAt.Before(candidate) {
+				candidate = triggerAt
 			}
 		}
 		return candidate.UTC()
@@ -307,7 +311,7 @@ func DueQuota(task Task, now time.Time, quotaResets []time.Time) bool {
 		last = now
 	}
 	for _, reset := range quotaResets {
-		if reset.IsZero() || reset.After(now) || !reset.After(last) {
+		if reset.IsZero() || reset.Add(QuotaResetDelay).After(now) || !reset.After(last) {
 			continue
 		}
 		return true

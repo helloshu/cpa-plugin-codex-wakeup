@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -205,10 +206,16 @@ func quotaResetTimes(account state.AccountState, window string) []time.Time {
 		if account.PrimaryResetAt != nil && !account.PrimaryResetAt.IsZero() {
 			times = append(times, account.PrimaryResetAt.UTC())
 		}
+		if account.PrimaryElapsedResetAt != nil {
+			times = append(times, account.PrimaryElapsedResetAt.UTC())
+		}
 	}
 	if window == state.QuotaWindowEither || window == state.QuotaWindowSecondary {
 		if account.SecondaryResetAt != nil && !account.SecondaryResetAt.IsZero() {
 			times = append(times, account.SecondaryResetAt.UTC())
+		}
+		if account.SecondaryElapsedResetAt != nil {
+			times = append(times, account.SecondaryElapsedResetAt.UTC())
 		}
 	}
 	return times
@@ -247,11 +254,109 @@ func (p *pluginRuntime) quotaTimesForTaskLocked(task state.Task) []time.Time {
 	return result
 }
 
-func (p *pluginRuntime) quotaTaskDue(task state.Task, now time.Time) bool {
+func quotaTaskSelectsAccount(task state.Task, authIndex string) bool {
+	if len(task.AccountIDs) == 0 {
+		return true
+	}
+	for _, id := range task.AccountIDs {
+		if strings.TrimSpace(id) == authIndex {
+			return true
+		}
+	}
+	return false
+}
+
+func quotaAccountBaseline(task state.Task, authIndex string) time.Time {
+	if task.QuotaHandledResets != nil {
+		if handled, ok := task.QuotaHandledResets[authIndex]; ok {
+			return handled
+		}
+	} else if task.LastRunAt != nil && !task.LastRunAt.IsZero() {
+		return *task.LastRunAt
+	}
+	return task.CreatedAt
+}
+
+func quotaDueReset(task state.Task, authIndex string, account state.AccountState, now time.Time) time.Time {
+	if !task.Enabled || strings.TrimSpace(account.QuotaLastError) != "" || !quotaTaskSelectsAccount(task, authIndex) {
+		return time.Time{}
+	}
+	baseline := quotaAccountBaseline(task, authIndex)
+	var due time.Time
+	for _, reset := range quotaResetTimes(account, quotaResetWindow(task)) {
+		if reset.After(baseline) && !reset.Add(state.QuotaResetDelay).After(now) && reset.After(due) {
+			due = reset
+		}
+	}
+	return due
+}
+
+func (p *pluginRuntime) quotaDueAccounts(task state.Task, now time.Time) []string {
 	p.mu.RLock()
-	resets := p.quotaTimesForTaskLocked(task)
-	p.mu.RUnlock()
-	return state.DueQuota(task, now, resets)
+	defer p.mu.RUnlock()
+	var accounts []string
+	for id, account := range p.state.Accounts {
+		if !quotaDueReset(task, id, account, now).IsZero() {
+			accounts = append(accounts, id)
+		}
+	}
+	sort.Strings(accounts)
+	return accounts
+}
+
+func (p *pluginRuntime) quotaNextRunAtLocked(task state.Task, now time.Time) time.Time {
+	var next time.Time
+	for id, account := range p.state.Accounts {
+		if !quotaTaskSelectsAccount(task, id) || strings.TrimSpace(account.QuotaLastError) != "" {
+			continue
+		}
+		accountTask := task
+		baseline := quotaAccountBaseline(task, id)
+		accountTask.LastRunAt = &baseline
+		candidate := state.NextRunAt(accountTask, now, quotaResetTimes(account, quotaResetWindow(task)))
+		if !candidate.IsZero() && (next.IsZero() || candidate.Before(next)) {
+			next = candidate
+		}
+	}
+	return next
+}
+
+// Initialize legacy accounts before advancing the task-wide LastRunAt, then
+// consume only boundaries for accounts actually attempted. In particular a
+// busy account remains pending while other accounts can complete independently.
+func (p *pluginRuntime) markQuotaResetsHandledLocked(task *state.Task, record state.RunRecord) {
+	if task.QuotaHandledResets == nil {
+		baseline := quotaAccountBaseline(*task, "")
+		task.QuotaHandledResets = make(map[string]time.Time)
+		for id := range p.state.Accounts {
+			if quotaTaskSelectsAccount(*task, id) {
+				task.QuotaHandledResets[id] = baseline
+			}
+		}
+		for _, id := range task.AccountIDs {
+			task.QuotaHandledResets[id] = baseline
+		}
+	} else {
+		// Task snapshots may outlive p.mu. Publish a new map instead of
+		// mutating the map referenced by an in-flight snapshot or API response.
+		handled := make(map[string]time.Time, len(task.QuotaHandledResets))
+		for id, reset := range task.QuotaHandledResets {
+			handled[id] = reset
+		}
+		task.QuotaHandledResets = handled
+	}
+	for _, result := range record.Results {
+		if result.AuthIndex == "" || result.Status == "skipped" {
+			continue
+		}
+		// Manual execution is still allowed for disabled tasks.
+		accountTask := *task
+		accountTask.Enabled = true
+		reset := quotaDueReset(accountTask, result.AuthIndex, p.state.Accounts[result.AuthIndex], record.StartedAt)
+		if !reset.IsZero() {
+			task.QuotaHandledResets[result.AuthIndex] = reset
+		}
+	}
 }
 
 func (p *pluginRuntime) refreshQuotaForTasks(ctx context.Context, tasks []state.Task) {
@@ -397,6 +502,10 @@ func (p *pluginRuntime) refreshAccountQuota(ctx context.Context, bridge host.Cli
 		next := attempt.Add(backoff)
 		account.QuotaNextRefreshAt = &next
 	} else {
+		// The reset can pass while the host callback is in flight.
+		observedAt := time.Now().UTC()
+		account.PrimaryElapsedResetAt = rememberElapsedReset(account.PrimaryElapsedResetAt, account.PrimaryResetAt, snapshot.PrimaryResetAt, observedAt)
+		account.SecondaryElapsedResetAt = rememberElapsedReset(account.SecondaryElapsedResetAt, account.SecondaryResetAt, snapshot.SecondaryResetAt, observedAt)
 		account.PrimaryResetAt = snapshot.PrimaryResetAt
 		account.SecondaryResetAt = snapshot.SecondaryResetAt
 		account.QuotaLastError = ""
@@ -413,7 +522,7 @@ func (p *pluginRuntime) refreshAccountQuota(ctx context.Context, bridge host.Cli
 		if state.NormalizeSchedule(task.Schedule, state.DefaultInterval).Kind != state.ScheduleKindQuotaReset {
 			continue
 		}
-		task.NextRunAt = state.NextRunAt(*task, attempt, p.quotaTimesForTaskLocked(*task))
+		task.NextRunAt = p.quotaNextRunAtLocked(*task, attempt)
 	}
 	snapshotState := p.state.Clone()
 	path := p.statePath
@@ -425,9 +534,31 @@ func (p *pluginRuntime) refreshAccountQuota(ctx context.Context, bridge host.Cli
 		p.log("warn", "quota state save failed", map[string]any{"error": scrubError(persistErr)})
 	}
 	if refreshErr != "" {
+		p.log("warn", "quota usage refresh failed", map[string]any{"auth_index": sanitizeText(entry.AuthIndex), "error": refreshErr})
 		return errors.New(refreshErr)
 	}
+	p.log("debug", "quota usage refreshed", map[string]any{
+		"auth_index": sanitizeText(entry.AuthIndex), "primary_reset_at": account.PrimaryResetAt,
+		"secondary_reset_at": account.SecondaryResetAt, "primary_elapsed_reset_at": account.PrimaryElapsedResetAt,
+		"secondary_elapsed_reset_at": account.SecondaryElapsedResetAt,
+	})
 	return persistErr
+}
+
+// Refresh happens before due evaluation. Preserve a known elapsed boundary
+// when a successful usage response advances or clears that window, otherwise
+// the scheduler sees only the next cycle and silently misses this one.
+func rememberElapsedReset(elapsed, previous, current *time.Time, now time.Time) *time.Time {
+	if previous == nil || previous.IsZero() || previous.After(now) {
+		return elapsed
+	}
+	if current != nil && !current.IsZero() && !current.After(*previous) {
+		return elapsed
+	}
+	if elapsed == nil || previous.After(*elapsed) {
+		return timePtr(previous.UTC())
+	}
+	return elapsed
 }
 
 func timePtr(value time.Time) *time.Time {

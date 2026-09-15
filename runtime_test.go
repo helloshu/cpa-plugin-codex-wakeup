@@ -127,9 +127,10 @@ func (h *runtimeFakeHost) HTTPDo(ctx context.Context, request host.HTTPRequest) 
 	return response, nil
 }
 
-func (h *runtimeFakeHost) Log(_ context.Context, _ string, message string, _ map[string]any) {
+func (h *runtimeFakeHost) Log(_ context.Context, level string, message string, fields map[string]any) {
 	h.mu.Lock()
-	h.logs = append(h.logs, message)
+	encoded, _ := json.Marshal(fields)
+	h.logs = append(h.logs, level+" "+message+" "+string(encoded))
 	h.mu.Unlock()
 }
 
@@ -397,6 +398,56 @@ func TestRuntimeHistoryAndLogsDoNotExposeCredential(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprint(loaded), secret) {
 		t.Fatalf("saved history leaked credential: %#v", loaded)
+	}
+	fake.mu.Lock()
+	logs := strings.Join(fake.logs, "\n")
+	fake.mu.Unlock()
+	if strings.Contains(logs, secret) || !strings.Contains(logs, "task run started") || !strings.Contains(logs, "task run finished") || !strings.Contains(logs, `"http_status":500`) {
+		t.Fatalf("run logs missing diagnostics or leaked credential: %s", logs)
+	}
+	diagnostics, _ := json.Marshal(p.diagnostics())
+	if strings.Contains(string(diagnostics), secret) || p.diagnostics()["last_error"] == "" {
+		t.Fatalf("diagnostics missing sanitized failure: %s", diagnostics)
+	}
+}
+
+func TestWorkerScansDueTasksImmediatelyAndReportsBlockedExecution(t *testing.T) {
+	base := newRuntimeFakeHost()
+	blocking := &blockingRuntimeHost{runtimeFakeHost: base, started: make(chan struct{}), release: make(chan struct{})}
+	p := newRuntimeForTest(t, blocking)
+	p.cfg.AutoWake = true
+	p.cfg.ScanInterval = time.Hour
+	due := testTask("overdue", []string{"auth-a"})
+	future := testTask("future", []string{"auth-b"})
+	future.CreatedAt = time.Now().UTC()
+	future.NextRunAt = future.CreatedAt.Add(time.Hour)
+	p.state.Tasks = []state.Task{due, future}
+	var release sync.Once
+	t.Cleanup(func() {
+		release.Do(func() { close(blocking.release) })
+		p.stopWorker()
+	})
+	p.mu.Lock()
+	p.startWorkerLocked()
+	p.mu.Unlock()
+	select {
+	case <-blocking.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("already-due task waited for the one-hour scan interval")
+	}
+	diagnostics := p.diagnostics()
+	heartbeat := diagnostics["scheduler"].(schedulerDiagnostics)
+	if diagnostics["scheduler_status"] != "running" || heartbeat.Phase != "executing" || heartbeat.CurrentTaskID != due.ID || heartbeat.LastScanAt == nil || heartbeat.LastScanCompletedAt != nil {
+		t.Fatalf("blocked execution diagnostics = %#v, %#v", diagnostics, heartbeat)
+	}
+	release.Do(func() { close(blocking.release) })
+	p.stopWorker()
+	heartbeat = p.diagnostics()["scheduler"].(schedulerDiagnostics)
+	if heartbeat.Phase != "stopped" || heartbeat.LastScanCompletedAt == nil || heartbeat.ScanCount != 1 {
+		t.Fatalf("stopped worker diagnostics = %#v", heartbeat)
+	}
+	if got := requestTokens(base); fmt.Sprint(got) != "[token-a]" {
+		t.Fatalf("run_on_start=false woke a not-yet-due task: %v", got)
 	}
 }
 

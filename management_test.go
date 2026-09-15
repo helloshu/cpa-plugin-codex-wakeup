@@ -20,6 +20,7 @@ func TestSaveTasksPreservesServerRuntimeFields(t *testing.T) {
 	old.NextRunAt = last.Add(4 * time.Hour)
 	old.SuccessCount = 9
 	old.FailureCount = 2
+	old.QuotaHandledResets = map[string]time.Time{"auth-a": last}
 	p.state.Tasks = []state.Task{old}
 	forged := old
 	forged.Name = "edited"
@@ -29,6 +30,7 @@ func TestSaveTasksPreservesServerRuntimeFields(t *testing.T) {
 	forged.NextRunAt = time.Now().UTC().Add(-100 * time.Hour)
 	forged.SuccessCount = 999
 	forged.FailureCount = 999
+	forged.QuotaHandledResets = map[string]time.Time{"auth-a": last.Add(24 * time.Hour)}
 	raw, _ := json.Marshal(saveTasksRequest{Tasks: []state.Task{forged, {ID: "new", Name: "new", Enabled: true, Schedule: state.Schedule{Interval: "5h"}}}})
 	response, err := p.saveTasks(raw)
 	if err != nil || response.StatusCode != 200 {
@@ -42,6 +44,9 @@ func TestSaveTasksPreservesServerRuntimeFields(t *testing.T) {
 	}
 	if saved.Name != "edited" || !saved.CreatedAt.Equal(old.CreatedAt) || saved.LastStatus != old.LastStatus || saved.SuccessCount != old.SuccessCount || saved.FailureCount != old.FailureCount || !saved.NextRunAt.Equal(old.NextRunAt) {
 		t.Fatalf("server fields were not preserved: %#v", saved)
+	}
+	if !saved.QuotaHandledResets["auth-a"].Equal(last) {
+		t.Fatalf("client forged quota cursor: %#v", saved.QuotaHandledResets)
 	}
 	for _, task := range p.state.Tasks {
 		if task.ID == "new" {
@@ -67,6 +72,27 @@ func TestAccountsResponseDoesNotRenderZeroTimestamp(t *testing.T) {
 	}
 	if strings.Contains(string(response.Body), `"id"`) {
 		t.Fatalf("accounts response exposed host ID instead of only auth_index: %s", response.Body)
+	}
+}
+
+func TestQuotaPreviewKeepsCloselySpacedAccountTriggers(t *testing.T) {
+	p := newRuntimeForTest(t, newRuntimeFakeHost())
+	first := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	second := first.Add(14 * time.Second)
+	p.state.Accounts["auth-a"] = state.AccountState{AuthIndex: "auth-a", PrimaryResetAt: timePtr(first)}
+	p.state.Accounts["auth-b"] = state.AccountState{AuthIndex: "auth-b", PrimaryResetAt: timePtr(second)}
+	response, err := p.previewTask([]byte(`{"task":{"account_ids":["auth-a","auth-b"],"schedule":{"kind":"quota_reset","quota_reset_window":"primary_window"}}}`))
+	if err != nil || response.StatusCode != 200 {
+		t.Fatalf("preview = %#v, %v", response, err)
+	}
+	var body struct {
+		Preview []time.Time `json:"preview"`
+	}
+	if err := json.Unmarshal(response.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Preview) != 2 || !body.Preview[0].Equal(first.Add(time.Minute)) || !body.Preview[1].Equal(second.Add(time.Minute)) {
+		t.Fatalf("preview lost an account within the delay interval: %s", response.Body)
 	}
 }
 

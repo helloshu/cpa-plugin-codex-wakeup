@@ -31,6 +31,7 @@ type pluginRuntime struct {
 	state     state.State
 	statePath string
 	closed    bool
+	scheduler schedulerDiagnostics
 
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -102,6 +103,7 @@ func (p *pluginRuntime) configure(raw []byte) error {
 	p.statePath = statePath
 	p.closed = false
 	p.configured = true
+	p.scheduler = schedulerDiagnostics{Phase: "stopped"}
 	// state.Normalize cannot inspect the runtime quota cache. Rebuild quota
 	// previews after loading so a restart does not temporarily erase a known
 	// next reset until the first background scan.
@@ -119,6 +121,10 @@ func (p *pluginRuntime) configure(raw []byte) error {
 	if loadErr != nil {
 		p.log("warn", "state file could not be loaded; using a fresh state", map[string]any{"error": scrubError(loadErr)})
 	}
+	p.log("info", "scheduler configured", map[string]any{
+		"enabled": cfg.Enabled, "auto_wake": cfg.AutoWake, "worker_running": shouldRun,
+		"scan_interval": cfg.ScanInterval.String(), "server_timezone": time.Now().Format("MST (UTC-07:00)"),
+	})
 	return nil
 }
 
@@ -323,49 +329,84 @@ func (p *pluginRuntime) shutdown() {
 
 func (p *pluginRuntime) worker(ctx context.Context, interval time.Duration, runOnStart bool) {
 	defer p.wg.Done()
-	if runOnStart {
-		p.runDue(ctx, true)
-	}
+	p.mu.Lock()
+	p.scheduler.StartedAt = timePtr(time.Now().UTC())
+	p.mu.Unlock()
+	p.log("info", "scheduler started", map[string]any{"scan_interval": interval.String()})
+	defer func() {
+		p.setScanPhase("stopped", "")
+		p.log("info", "scheduler stopped", nil)
+	}()
+	// Already-due tasks should not wait another scan interval after a restart.
+	// run_on_start only controls the extra run of never-run, not-yet-due tasks.
+	p.runDue(ctx, runOnStart)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
+		case <-ticker.C:
 			p.runDue(ctx, false)
-			_ = now
 		}
 	}
 }
 
 func (p *pluginRuntime) runDue(ctx context.Context, includeStartup bool) {
+	if ctx.Err() != nil {
+		return
+	}
+	p.mu.Lock()
+	p.scheduler.LastScanAt = timePtr(time.Now().UTC())
+	p.scheduler.ScanCount++
+	p.scheduler.Phase = "quota_refresh"
+	p.scheduler.CurrentTaskID = ""
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.scheduler.LastScanCompletedAt = timePtr(time.Now().UTC())
+		p.scheduler.Phase = "idle"
+		p.scheduler.CurrentTaskID = ""
+		p.mu.Unlock()
+	}()
 	p.mu.RLock()
 	tasks := append([]state.Task(nil), p.state.Tasks...)
 	runOnStart := p.cfg.RunOnStart
 	p.mu.RUnlock()
 	p.refreshQuotaForTasks(ctx, tasks)
-	now := time.Now().UTC()
+	// A refresh may take time; pick up edits and completed manual runs before
+	// deciding which tasks are due, rather than using the pre-refresh snapshot.
+	p.mu.RLock()
+	tasks = append([]state.Task(nil), p.state.Tasks...)
+	p.mu.RUnlock()
+	p.setScanPhase("evaluating", "")
 	for _, task := range tasks {
 		if ctx.Err() != nil {
 			return
 		}
+		p.setScanPhase("evaluating", task.ID)
 		kind := state.NormalizeSchedule(task.Schedule, state.DefaultInterval).Kind
+		now := time.Now().UTC()
 		if kind == state.ScheduleKindStartup {
 			// Startup tasks are scheduled by startWorkerLocked so delayed tasks
 			// can coexist with the regular scan loop and run exactly once.
 			continue
 		}
 		if kind == state.ScheduleKindQuotaReset {
-			if !p.quotaTaskDue(task, now) {
+			accounts := p.quotaDueAccounts(task, now)
+			if len(accounts) == 0 {
+				p.logTaskNotDue(task)
 				continue
 			}
-			_, _ = p.executeTask(ctx, task, "quota_reset", nil, nil, true)
+			p.setScanPhase("executing", task.ID)
+			_, _ = p.executeTask(ctx, task, "quota_reset", accounts, nil, true)
 			continue
 		}
 		if !state.Due(task, now, includeStartup && runOnStart) {
+			p.logTaskNotDue(task)
 			continue
 		}
+		p.setScanPhase("executing", task.ID)
 		_, _ = p.executeTask(ctx, task, "schedule", nil, nil, true)
 	}
 }
@@ -379,7 +420,7 @@ func (p *pluginRuntime) recomputeTaskNextRunsLocked(now time.Time) {
 		case state.ScheduleKindStartup:
 			task.NextRunAt = time.Time{}
 		case state.ScheduleKindQuotaReset:
-			task.NextRunAt = state.NextRunAt(*task, now, p.quotaTimesForTaskLocked(*task))
+			task.NextRunAt = p.quotaNextRunAtLocked(*task, now)
 		default:
 			if task.NextRunAt.IsZero() {
 				task.NextRunAt = state.NextRunAt(*task, now, nil)
@@ -415,10 +456,11 @@ type accountCandidate struct {
 	key   string
 }
 
-func (p *pluginRuntime) executeTask(ctx context.Context, task state.Task, trigger string, selected []string, override *wakeSettings, persistTask bool) (state.RunRecord, error) {
+func (p *pluginRuntime) executeTask(ctx context.Context, task state.Task, trigger string, selected []string, override *wakeSettings, persistTask bool) (record state.RunRecord, err error) {
 	started := time.Now().UTC()
 	runID := fmt.Sprintf("%d-%d", started.UnixNano(), atomic.AddUint64(&p.runSequence, 1))
-	record := state.RunRecord{RunID: runID, TaskID: task.ID, Trigger: trigger, StartedAt: started}
+	record = state.RunRecord{RunID: runID, TaskID: task.ID, Trigger: trigger, StartedAt: started}
+	defer func() { p.logRunResult(record, err) }()
 	lock := p.taskLock(task.ID)
 	if task.ID != "" && !lock.TryLock() {
 		record.Status = "skipped"
@@ -441,6 +483,9 @@ func (p *pluginRuntime) executeTask(ctx context.Context, task state.Task, trigge
 	if ctx.Err() != nil {
 		return record, ctx.Err()
 	}
+	p.log("info", "task run started", map[string]any{
+		"run_id": runID, "task_id": sanitizeText(task.ID), "trigger": trigger, "scheduled_at": task.NextRunAt,
+	})
 
 	entries, err := bridge.ListAuthFiles(ctx)
 	if err != nil {
@@ -641,6 +686,9 @@ func (p *pluginRuntime) finishRun(record state.RunRecord, task state.Task, candi
 			continue
 		}
 		now := record.CompletedAt
+		if state.NormalizeSchedule(p.state.Tasks[index].Schedule, state.DefaultInterval).Kind == state.ScheduleKindQuotaReset {
+			p.markQuotaResetsHandledLocked(&p.state.Tasks[index], record)
+		}
 		p.state.Tasks[index].LastRunAt = &now
 		p.state.Tasks[index].LastStatus = record.Status
 		for _, result := range record.Results {
@@ -657,7 +705,7 @@ func (p *pluginRuntime) finishRun(record state.RunRecord, task state.Task, candi
 			// makes that semantic visible after the task has fired.
 			updated.NextRunAt = time.Time{}
 		case state.ScheduleKindQuotaReset:
-			updated.NextRunAt = state.NextRunAt(*updated, now, p.quotaTimesForTaskLocked(*updated))
+			updated.NextRunAt = p.quotaNextRunAtLocked(*updated, now)
 		default:
 			updated.NextRunAt = state.NextRunAt(*updated, now.In(time.Local), nil)
 		}
@@ -731,11 +779,14 @@ func (p *pluginRuntime) stateSnapshot() (state.State, config.Config, string, boo
 }
 
 func (p *pluginRuntime) log(level, message string, fields map[string]any) {
-	p.mu.RLock()
+	p.mu.Lock()
 	bridge := p.host
-	p.mu.RUnlock()
+	if value, ok := fields["error"].(string); ok && value != "" {
+		p.scheduler.LastError = sanitizeText(value)
+	}
+	p.mu.Unlock()
 	if bridge != nil {
-		bridge.Log(context.Background(), level, message, fields)
+		bridge.Log(context.Background(), level, pluginName+": "+message, fields)
 	}
 }
 

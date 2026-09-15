@@ -27,6 +27,7 @@ const (
 	MinimumInterval        = time.Minute
 	MaximumInterval        = 30 * 24 * time.Hour
 	MaximumStartupDelay    = 7 * 24 * time.Hour
+	QuotaResetDelay        = time.Minute
 )
 
 var ErrCorruptState = errors.New("corrupt codex-wakeup state was quarantined")
@@ -61,6 +62,9 @@ type Task struct {
 	NextRunAt       time.Time  `json:"next_run_at"`
 	SuccessCount    int64      `json:"success_count"`
 	FailureCount    int64      `json:"failure_count"`
+	// Per-account reset boundary already attempted by this quota task. A nil
+	// map denotes legacy state, which used the task-wide LastRunAt baseline.
+	QuotaHandledResets map[string]time.Time `json:"quota_handled_resets,omitempty"`
 }
 
 type AccountState struct {
@@ -79,12 +83,17 @@ type AccountState struct {
 	FailureCount   int64     `json:"failure_count"`
 	// Quota fields contain only timestamps and sanitized diagnostics. OAuth
 	// material and the usage response body are never persisted.
-	PrimaryResetAt       *time.Time `json:"primary_reset_at,omitempty"`
-	SecondaryResetAt     *time.Time `json:"secondary_reset_at,omitempty"`
-	QuotaLastRefreshAt   *time.Time `json:"quota_last_refresh_at,omitempty"`
-	QuotaNextRefreshAt   *time.Time `json:"quota_next_refresh_at,omitempty"`
-	QuotaLastError       string     `json:"quota_last_error,omitempty"`
-	QuotaRefreshFailures int        `json:"quota_refresh_failures,omitempty"`
+	PrimaryResetAt   *time.Time `json:"primary_reset_at,omitempty"`
+	SecondaryResetAt *time.Time `json:"secondary_reset_at,omitempty"`
+	// Keep the most recent elapsed boundary when usage rolls forward. Tasks
+	// consume it independently using LastRunAt (or CreatedAt), including after
+	// a restart between the refresh and execution.
+	PrimaryElapsedResetAt   *time.Time `json:"primary_elapsed_reset_at,omitempty"`
+	SecondaryElapsedResetAt *time.Time `json:"secondary_elapsed_reset_at,omitempty"`
+	QuotaLastRefreshAt      *time.Time `json:"quota_last_refresh_at,omitempty"`
+	QuotaNextRefreshAt      *time.Time `json:"quota_next_refresh_at,omitempty"`
+	QuotaLastError          string     `json:"quota_last_error,omitempty"`
+	QuotaRefreshFailures    int        `json:"quota_refresh_failures,omitempty"`
 }
 
 type AccountResult struct {
@@ -170,6 +179,12 @@ func (s State) Clone() State {
 	for index := range clone.Tasks {
 		clone.Tasks[index].AccountIDs = append([]string(nil), clone.Tasks[index].AccountIDs...)
 		clone.Tasks[index].Schedule.WeeklyDays = append([]int(nil), clone.Tasks[index].Schedule.WeeklyDays...)
+		if clone.Tasks[index].QuotaHandledResets != nil {
+			clone.Tasks[index].QuotaHandledResets = make(map[string]time.Time, len(s.Tasks[index].QuotaHandledResets))
+			for key, value := range s.Tasks[index].QuotaHandledResets {
+				clone.Tasks[index].QuotaHandledResets[key] = value
+			}
+		}
 	}
 	clone.Accounts = make(map[string]AccountState, len(s.Accounts))
 	for key, value := range s.Accounts {
