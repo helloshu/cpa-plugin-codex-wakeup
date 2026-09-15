@@ -56,7 +56,6 @@ const managementNamespace = "/codex-wakeup"
 func managementRegistration() managementRegistrationResponse {
 	return managementRegistrationResponse{
 		Routes: []managementRoute{
-			{Method: http.MethodGet, Path: managementNamespace + "/ui", Description: "由已登录的管理中心加载内嵌页面。"},
 			{Method: http.MethodGet, Path: managementNamespace + "/overview", Description: "查看唤醒插件概览。"},
 			{Method: http.MethodGet, Path: managementNamespace + "/accounts", Description: "查看可唤醒的 Codex OAuth 账号。"},
 			{Method: http.MethodPost, Path: managementNamespace + "/preview", Description: "按服务器本地时区预览任务的后续触发时间。"},
@@ -82,8 +81,6 @@ func (p *pluginRuntime) handleManagement(request managementRequest) (managementR
 	switch {
 	case method == http.MethodGet && path == "/status":
 		return p.statusResource(), nil
-	case method == http.MethodGet && request.Path == "/v0/management"+managementNamespace+"/ui":
-		return p.embeddedUI(), nil
 	case method == http.MethodGet && path == "/overview":
 		return p.jsonManagementResponse(p.overview())
 	case method == http.MethodGet && path == "/accounts":
@@ -777,13 +774,6 @@ func uniqueNonEmpty(values []string) []string {
 	return result
 }
 
-func (p *pluginRuntime) embeddedUI() managementResponse {
-	response := p.statusResource()
-	response.Headers["Content-Security-Policy"] = []string{embeddedCSP}
-	response.Body = []byte(strings.Replace(codexWakeupHTMLV2, standaloneCSP, embeddedCSP, 1))
-	return response
-}
-
 func (p *pluginRuntime) statusResource() managementResponse {
-	return managementResponse{StatusCode: http.StatusOK, Headers: map[string][]string{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}, "Content-Security-Policy": {standaloneCSP}, "X-Content-Type-Options": {"nosniff"}}, Body: []byte(codexWakeupHTMLV2)}
+	return managementResponse{StatusCode: http.StatusOK, Headers: map[string][]string{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}, "Content-Security-Policy": {"default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"}}, Body: []byte(codexWakeupHTMLV2)}
 }

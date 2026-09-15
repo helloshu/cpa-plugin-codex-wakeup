@@ -31,16 +31,6 @@ for arch in amd64 arm64; do
   archives+=("$archive_name")
 done
 
-for asset in management.html management.LICENSE.txt; do
-  source_file="$plugin_root/dist/management/$asset"
-  if [[ ! -f "$source_file" ]]; then
-    echo "missing management output: $source_file; run bash scripts/build-management.sh first" >&2
-    exit 1
-  fi
-  cp "$source_file" "$release_dir/$asset"
-  archives+=("$asset")
-done
-
 (
   cd "$release_dir"
   sha256sum "${archives[@]}" > checksums.txt

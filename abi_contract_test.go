@@ -182,14 +182,4 @@ func TestManagementRegistrationAndResponseWire(t *testing.T) {
 	if !strings.Contains(csp, "connect-src 'self'") {
 		t.Fatalf("status CSP does not allow same-origin fetch: %q", csp)
 	}
-	embedded, err := p.handleManagement(managementRequest{Method: http.MethodGet, Path: "/v0/management/codex-wakeup/ui"})
-	if err != nil || embedded.StatusCode != http.StatusOK || !strings.Contains(string(embedded.Body), "connect-src 'none'") {
-		t.Fatalf("embedded UI response = %#v, %v", embedded, err)
-	}
-	for _, path := range []string{"/v0/resource/plugins/codex-wakeup/ui", "/ui"} {
-		response, err := p.handleManagement(managementRequest{Method: http.MethodGet, Path: path})
-		if err != nil || response.StatusCode != http.StatusNotFound {
-			t.Fatalf("embedded UI exposed outside management route: %s", path)
-		}
-	}
 }

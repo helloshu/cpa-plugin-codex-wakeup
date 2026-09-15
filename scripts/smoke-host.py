@@ -19,15 +19,12 @@ def check(condition, message):
         raise AssertionError(message)
 
 
-def smoke(host, plugin, management_html=None, browser_test=False):
+def smoke(host, plugin):
     with tempfile.TemporaryDirectory(prefix="codex-wakeup-smoke-") as directory:
         root = Path(directory)
         (root / "auth").mkdir()
         (root / "plugins").mkdir()
         shutil.copy2(plugin, root / "plugins/codex-wakeup.so")
-        if management_html:
-            (root / "static").mkdir()
-            shutil.copy2(management_html, root / "static/management.html")
         key = secrets.token_urlsafe(32)
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -39,8 +36,7 @@ def smoke(host, plugin, management_html=None, browser_test=False):
             "remote-management": {
                 "allow-remote": False,
                 "secret-key": key,
-                "disable-control-panel": not bool(management_html),
-                "disable-auto-update-panel": True,
+                "disable-control-panel": True,
             },
             "plugins": {
                 "enabled": True,
@@ -99,14 +95,6 @@ def smoke(host, plugin, management_html=None, browser_test=False):
                 check(overview["default_model"] == "smoke-model", "config_yaml was not decoded")
                 page = request("/v0/resource/plugins/codex-wakeup/status", authenticated=False)
                 check("Codex 唤醒" in page, "native resource route is unavailable")
-                embedded_page = api("ui")
-                check("connect-src 'none'" in embedded_page, "embedded UI allows direct network access")
-                try:
-                    api("ui", authenticated=False)
-                except urllib.error.HTTPError as error:
-                    check(error.code == 401, "embedded document is not management-authenticated")
-                else:
-                    raise AssertionError("embedded document accepted an unauthenticated request")
                 check(api("accounts")["accounts"] == [], "host.auth.list did not return an empty account list")
 
                 task = {
@@ -150,13 +138,6 @@ def smoke(host, plugin, management_html=None, browser_test=False):
                 check(diagnostics["abi_version"] == 1, "unexpected ABI version")
                 check(diagnostics["schema_version"] == 6, "schema 6 is not supported")
                 check(diagnostics["scheduler_status"] == "auto_wake_disabled", "scheduler unexpectedly active")
-                if browser_test:
-                    check(management_html, "browser test requires --management-html")
-                    subprocess.run(
-                        ["node", str(Path(__file__).with_name("smoke-browser.cjs").resolve())],
-                        input=json.dumps({"base": f"http://127.0.0.1:{port}", "key": key}),
-                        text=True, check=True, timeout=120,
-                    )
                 print(f"CPA native smoke passed: codex-wakeup {overview['version']}; "
                       "registration, config, auth list, resource, management auth, "
                       "task CRUD/persistence/preview, raw JSON text, history and diagnostics")
@@ -176,9 +157,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", required=True, type=Path, help="CPA executable (with native plugin support)")
     parser.add_argument("--plugin", required=True, type=Path, help="Linux AMD64 codex-wakeup.so")
-    parser.add_argument("--management-html", type=Path, help="Companion management.html")
-    parser.add_argument("--browser-test", action="store_true", help="Run Playwright browser checks")
     args = parser.parse_args()
-    smoke(args.host.resolve(strict=True), args.plugin.resolve(strict=True),
-          args.management_html.resolve(strict=True) if args.management_html else None,
-          args.browser_test)
+    smoke(args.host.resolve(strict=True), args.plugin.resolve(strict=True))

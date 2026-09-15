@@ -14,7 +14,7 @@
 
 注册和重新配置时以 `min(宿主 schema_version, 6)` 应答；宿主缺失或传入 0 时按 schema 1 处理。单元测试覆盖 schema 1–6、缺失/0 和未来版本的协商，保留旧宿主的协议回退；旧宿主尚未逐版本进行完整实测。schema 6 避免宿主把管理 JSON 字符串里的 `<`、`>`、`&`、引号转成 HTML 实体，防止任务名称或提示词在读取、编辑后发生变化。页面动态内容通过文本节点渲染，敏感字段仍会脱敏。
 
-管理 API 由宿主管理 key 保护。使用配套管理中心时，内嵌页复用管理中心的登录会话，无需再次输入 key；独立页仍手动输入 key，仅在本页内存使用，key 为空时不请求管理 API。内嵌鉴权需要同时更新插件和配套 `management.html`，详见 [Podman 部署与管理中心说明](management-center/README.md)。
+管理 API 的变更路由由宿主管理 key 保护；插件页面只在浏览器内存中使用用户输入的 key。页面在 key 为空时不会请求任何管理 API，避免被 CLIProxyAPI 的失败计数误封来源 IP。
 
 ## 构建与安装
 
@@ -61,8 +61,7 @@ dist/linux/amd64/codex-wakeup.so
 同时构建 Linux AMD64/ARM64 后，可生成符合 plugin-store 命名规则的 zip 和校验文件：
 
 ```bash
-bash scripts/build-management.sh
-./scripts/package-release.sh 0.1.8
+./scripts/package-release.sh 0.1.7
 ```
 
 ## 配置示例
@@ -151,8 +150,6 @@ plugins:
 /v0/resource/plugins/codex-wakeup/status
 ```
 
-从管理中心内嵌打开时，配套页面使用已登录的 API 客户端加载 `/v0/management/codex-wakeup/ui`，通过受限 MessagePort 代理本插件请求。插件 iframe 无法读取管理 key、父页存储，也不直接联网。独立打开上面的 `/status` 页面则手动输入 key。官方管理中心尚无此代理能力，请同时安装同一 Release 的 `management.html`；只升级插件不能启用内嵌免重复输入。
-
 管理 API 命名空间：
 
 ```text
@@ -164,7 +161,6 @@ plugins:
 /v0/management/codex-wakeup/wake         POST
 /v0/management/codex-wakeup/history
 /v0/management/codex-wakeup/diagnostics
-/v0/management/codex-wakeup/ui          GET（配套管理中心使用）
 ```
 
 `POST /wake` 支持三种选择：
@@ -192,8 +188,7 @@ go test ./...
 go vet ./...
 go test -race ./...
 ./scripts/build.sh
-bash scripts/build-management.sh
-./scripts/package-release.sh 0.1.8
+./scripts/package-release.sh 0.1.7
 nm -D --defined-only dist/linux/amd64/codex-wakeup.so | grep cliproxy_plugin_init
 sha256sum dist/linux/amd64/codex-wakeup.so
 ```
@@ -209,5 +204,3 @@ python3 scripts/smoke-host.py \
 ```
 
 脚本创建临时配置和空账号目录，仅监听本机，关闭自动唤醒；测试结束后停止宿主、清理目录。检查范围包含管理鉴权、任务增删改/启停/持久化、触发预览，以及特殊字符在保存与读取后的内容一致性。CI 固定运行 CLIProxyAPI v7.3.3 的 Linux AMD64 实测；ARM64 进行交叉构建。两类测试均不向真实 Codex endpoint 发请求，尚未覆盖真实账号的额度重置全过程。
-
-CI 还构建配套管理中心并运行 Chromium 浏览器检查：内嵌页免重复输入 key、刷新/重新打开、任务操作、退出登录，以及独立页面手动输入和空 key 请求拦截。
